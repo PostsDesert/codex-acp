@@ -395,6 +395,14 @@ impl Thread {
         // prompt callers observe a clean cancellation instead of a dropped response channel.
         Ok(())
     }
+
+    pub async fn request_shutdown(&self) -> Result<(), Error> {
+        self.thread
+            .submit(Op::Shutdown)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))
+    }
 }
 
 enum PendingPermissionRequest {
@@ -3603,6 +3611,8 @@ struct ThreadActor<A> {
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
     /// Current collaboration mode kind for this session.
     current_collaboration_mode_kind: ModeKind,
+    /// Response waiting for Codex core to emit `ShutdownComplete`.
+    pending_shutdown: Option<oneshot::Sender<Result<(), Error>>>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -3629,6 +3639,7 @@ impl<A: Auth> ThreadActor<A> {
             resolution_rx,
             last_sent_config_options: None,
             current_collaboration_mode_kind: ModeKind::Default,
+            pending_shutdown: None,
         }
     }
 
@@ -3648,6 +3659,12 @@ impl<A: Auth> ThreadActor<A> {
                     Ok(event) => self.handle_event(event).await,
                     Err(e) => {
                         error!("Error getting next event: {:?}", e);
+                        if let Some(response_tx) = self.pending_shutdown.take() {
+                            drop(
+                                response_tx
+                                    .send(Err(Error::from(anyhow::anyhow!(e.to_string())))),
+                            );
+                        }
                         break;
                     }
                 }
@@ -3711,8 +3728,7 @@ impl<A: Auth> ThreadActor<A> {
                 drop(response_tx.send(result));
             }
             ThreadMessage::Shutdown { response_tx } => {
-                let result = self.handle_shutdown().await;
-                drop(response_tx.send(result));
+                self.handle_shutdown(response_tx).await;
             }
             ThreadMessage::ReplayHistory {
                 history,
@@ -4523,13 +4539,28 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
-    async fn handle_shutdown(&mut self) -> Result<(), Error> {
+    async fn handle_shutdown(&mut self, response_tx: oneshot::Sender<Result<(), Error>>) {
+        if self.pending_shutdown.is_some() {
+            drop(response_tx.send(Err(
+                Error::internal_error().data("shutdown already in progress"),
+            )));
+            return;
+        }
+
         self.abort_pending_interactions();
-        self.thread
+        match self
+            .thread
             .submit(Op::Shutdown)
             .await
-            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-        Ok(())
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))
+        {
+            Ok(_) => {
+                self.pending_shutdown = Some(response_tx);
+            }
+            Err(err) => {
+                drop(response_tx.send(Err(err)));
+            }
+        }
     }
 
     fn abort_pending_interactions(&mut self) {
@@ -4863,6 +4894,12 @@ impl<A: Auth> ThreadActor<A> {
             self.current_collaboration_mode_kind = *collaboration_mode_kind;
         }
 
+        if matches!(&msg, EventMsg::ShutdownComplete) {
+            if let Some(response_tx) = self.pending_shutdown.take() {
+                drop(response_tx.send(Ok(())));
+            }
+        }
+
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else if matches!(
@@ -4878,7 +4915,7 @@ impl<A: Auth> ThreadActor<A> {
                 }
                 _ => unreachable!(),
             }
-        } else {
+        } else if !matches!(&msg, EventMsg::ShutdownComplete) {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
         }
     }
@@ -6257,6 +6294,7 @@ mod tests {
     struct StubCodexThread {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
+        shutdown_complete_delay: std::sync::Mutex<Option<Duration>>,
         ops: std::sync::Mutex<Vec<Op>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
@@ -6268,10 +6306,15 @@ mod tests {
             StubCodexThread {
                 current_id: AtomicUsize::new(0),
                 active_prompt_id: std::sync::Mutex::default(),
+                shutdown_complete_delay: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
             }
+        }
+
+        fn delay_shutdown_complete(&self, delay: Duration) {
+            *self.shutdown_complete_delay.lock().unwrap() = Some(delay);
         }
     }
 
@@ -6731,6 +6774,23 @@ mod tests {
                                 })
                                 .unwrap();
                         }
+
+                        let delay = self
+                            .shutdown_complete_delay
+                            .lock()
+                            .unwrap()
+                            .unwrap_or_default();
+                        let op_tx = self.op_tx.clone();
+                        let event_id = id.to_string();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            op_tx
+                                .send(Event {
+                                    id: event_id,
+                                    msg: EventMsg::ShutdownComplete,
+                                })
+                                .unwrap();
+                        });
                     }
                     _ => {
                         unimplemented!()
@@ -7614,6 +7674,49 @@ mod tests {
 
         let ops = conversation.ops.lock().unwrap();
         assert!(matches!(ops.last(), Some(Op::Shutdown)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_thread_shutdown_waits_for_shutdown_complete() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        conversation.delay_shutdown_complete(Duration::from_millis(75));
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+
+        let handle = tokio::spawn(actor.spawn());
+        let thread = Thread {
+            thread: conversation.clone(),
+            message_tx,
+            _handle: handle,
+        };
+
+        let early_shutdown =
+            tokio::time::timeout(Duration::from_millis(20), thread.shutdown()).await;
+        assert!(
+            early_shutdown.is_err(),
+            "shutdown returned before Codex emitted ShutdownComplete"
+        );
 
         Ok(())
     }
