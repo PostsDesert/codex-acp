@@ -1,3 +1,8 @@
+# Merges
+
+- https://github.com/zed-industries/codex-acp/pull/247
+
+
 # ACP adapter for Codex
 
 Use [Codex](https://github.com/openai/codex) from [ACP-compatible](https://agentclientprotocol.com) clients such as [Zed](https://zed.dev)!
