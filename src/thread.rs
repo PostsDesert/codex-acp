@@ -167,7 +167,7 @@ impl ModelsManagerImpl for CodexModelsManagerAdapter {
     fn list_collaboration_modes(
         &self,
     ) -> Pin<Box<dyn Future<Output = Vec<CollaborationModeMask>> + Send + '_>> {
-        Box::pin(async move { self.list_collaboration_modes() })
+        Box::pin(async move { self.0.list_collaboration_modes() })
     }
 }
 
