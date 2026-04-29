@@ -38,7 +38,9 @@ use codex_protocol::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    config_types::{CollaborationMode, CollaborationModeMask, ModeKind, Settings, TrustLevel},
+    config_types::{
+        CollaborationMode, CollaborationModeMask, ModeKind, ServiceTier, Settings, TrustLevel,
+    },
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     items::TurnItem,
@@ -3789,6 +3791,8 @@ struct ThreadActor<A> {
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
     /// Current collaboration mode kind for this session.
     current_collaboration_mode_kind: ModeKind,
+    /// Runtime service tier resolved by Codex core.
+    effective_service_tier: Option<ServiceTier>,
     /// Response waiting for Codex core to emit `ShutdownComplete`.
     pending_shutdown: Option<oneshot::Sender<Result<(), Error>>>,
     /// Skills discovered for the current working directory.
@@ -3809,6 +3813,7 @@ impl<A: Auth> ThreadActor<A> {
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     ) -> Self {
+        let effective_service_tier = config.service_tier;
         Self {
             auth,
             client,
@@ -3821,6 +3826,7 @@ impl<A: Auth> ThreadActor<A> {
             resolution_rx,
             last_sent_config_options: None,
             current_collaboration_mode_kind: ModeKind::Default,
+            effective_service_tier,
             pending_shutdown: None,
             skills: Vec::new(),
             background_terminals: Vec::new(),
@@ -4053,6 +4059,65 @@ impl<A: Auth> ThreadActor<A> {
         }
     }
 
+    async fn handle_fast_command(&mut self, args: &str) -> Result<(), Error> {
+        let next_tier = match args.trim().to_ascii_lowercase().as_str() {
+            "" => {
+                if matches!(self.effective_service_tier, Some(ServiceTier::Fast)) {
+                    None
+                } else {
+                    Some(ServiceTier::Fast)
+                }
+            }
+            "on" => Some(ServiceTier::Fast),
+            "off" => None,
+            "status" => {
+                let status = if matches!(self.effective_service_tier, Some(ServiceTier::Fast)) {
+                    "on"
+                } else {
+                    "off"
+                };
+                self.client
+                    .send_agent_text(format!("Fast mode is {status}.\n"));
+                return Ok(());
+            }
+            _ => {
+                self.client
+                    .send_agent_text("Usage: /fast [on|off|status]\n".to_string());
+                return Ok(());
+            }
+        };
+
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: Some(next_tier),
+                approvals_reviewer: None,
+                permission_profile: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.service_tier = next_tier;
+        self.effective_service_tier = next_tier;
+        let status = if matches!(next_tier, Some(ServiceTier::Fast)) {
+            "on"
+        } else {
+            "off"
+        };
+        self.client
+            .send_agent_text(format!("Fast mode set to {status}\n"));
+
+        Ok(())
+    }
+
     fn builtin_commands() -> Vec<AvailableCommand> {
         vec![
             AvailableCommand::new("review", "Review my current changes and find issues").input(
@@ -4086,6 +4151,10 @@ impl<A: Auth> ThreadActor<A> {
                 AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("new name")),
             ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
+            AvailableCommand::new(
+                "fast",
+                "toggle Fast mode to enable fastest inference with increased plan usage",
+            ),
             AvailableCommand::new("ps", "list background terminals"),
             AvailableCommand::new("stop", "stop all background terminals"),
             AvailableCommand::new("clean", "stop all background terminals"),
@@ -4694,6 +4763,11 @@ impl<A: Auth> ThreadActor<A> {
                         drop(response_tx.send(Ok(StopReason::EndTurn)));
                         return Ok(response_rx);
                     }
+                    "fast" => {
+                        self.handle_fast_command(rest).await?;
+                        drop(response_tx.send(Ok(StopReason::EndTurn)));
+                        return Ok(response_rx);
+                    }
                     "stop" | "clean" => {
                         self.thread
                             .submit(Op::CleanBackgroundTerminals)
@@ -5013,6 +5087,7 @@ impl<A: Auth> ThreadActor<A> {
                 self.client.send_agent_thought(text.clone());
             }
             EventMsg::SessionConfigured(event) => {
+                self.effective_service_tier = event.service_tier;
                 send_session_title_update(&self.client, event.thread_name.clone());
             }
             EventMsg::ThreadNameUpdated(event) => {
@@ -5612,6 +5687,10 @@ impl<A: Auth> ThreadActor<A> {
         }) = &msg
         {
             self.current_collaboration_mode_kind = *collaboration_mode_kind;
+        }
+
+        if let EventMsg::SessionConfigured(event) = &msg {
+            self.effective_service_tier = event.service_tier;
         }
 
         if matches!(&msg, EventMsg::ShutdownComplete) {
@@ -6229,6 +6308,95 @@ mod tests {
 
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Undo]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_enables_service_tier() -> anyhow::Result<()> {
+        let (client, thread, mut actor) = setup_actor().await?;
+
+        let response_rx = actor
+            .handle_prompt(PromptRequest::new(
+                SessionId::new("test"),
+                vec!["/fast".into()],
+            ))
+            .await?;
+        assert_eq!(response_rx.await??, StopReason::EndTurn);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::OverrideTurnContext {
+                model: None,
+                effort: None,
+                service_tier: Some(Some(ServiceTier::Fast)),
+                ..
+            })
+        ));
+        assert_eq!(actor.config.service_tier, Some(ServiceTier::Fast));
+        assert_eq!(actor.effective_service_tier, Some(ServiceTier::Fast));
+
+        let notifications = client.notifications.lock().unwrap();
+        let text = agent_text(&notifications);
+        assert!(text.contains("Fast mode set to on"), "{text}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_toggles_off_when_enabled() -> anyhow::Result<()> {
+        let (client, thread, mut actor) = setup_actor().await?;
+        actor.config.service_tier = Some(ServiceTier::Fast);
+        actor.effective_service_tier = Some(ServiceTier::Fast);
+
+        let response_rx = actor
+            .handle_prompt(PromptRequest::new(
+                SessionId::new("test"),
+                vec!["/fast".into()],
+            ))
+            .await?;
+        assert_eq!(response_rx.await??, StopReason::EndTurn);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::OverrideTurnContext {
+                model: None,
+                effort: None,
+                service_tier: Some(None),
+                ..
+            })
+        ));
+        assert_eq!(actor.config.service_tier, None);
+        assert_eq!(actor.effective_service_tier, None);
+
+        let notifications = client.notifications.lock().unwrap();
+        let text = agent_text(&notifications);
+        assert!(text.contains("Fast mode set to off"), "{text}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_status_reports_current_state() -> anyhow::Result<()> {
+        let (client, thread, mut actor) = setup_actor().await?;
+        actor.effective_service_tier = Some(ServiceTier::Fast);
+
+        let response_rx = actor
+            .handle_prompt(PromptRequest::new(
+                SessionId::new("test"),
+                vec!["/fast status".into()],
+            ))
+            .await?;
+        assert_eq!(response_rx.await??, StopReason::EndTurn);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(ops.is_empty(), "status should not submit an override");
+
+        let notifications = client.notifications.lock().unwrap();
+        let text = agent_text(&notifications);
+        assert!(text.contains("Fast mode is on."), "{text}");
 
         Ok(())
     }
