@@ -1,17 +1,17 @@
 use acp::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
     AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, ForkSessionRequest,
-    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ClientCapabilities, ClientRequest, CloseSessionRequest, CloseSessionResponse, ExtRequest,
+    ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, McpServerHttp,
-    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    McpServerStdio, Meta, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
     PromptResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities,
     SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
-use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
+use acp::{Agent, Client, ConnectTo, ConnectionTo, Error, Handled};
 use agent_client_protocol as acp;
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
@@ -28,6 +28,7 @@ use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
 };
+use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -60,6 +61,17 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+const ZED_SESSION_TRUNCATE_META_KEY: &str = "zed:session_truncate";
+const ZED_SESSION_TRUNCATE_METHOD: &str = "zed/session_truncate";
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TruncateSessionRequest {
+    session_id: SessionId,
+    message_id: String,
+    user_message_index: usize,
+    user_message_count: usize,
+}
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -228,6 +240,26 @@ impl CodexAgent {
                             responder.respond_with_result(agent.prompt(request).await)
                         })?;
                         Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: ClientRequest, responder, cx: ConnectionTo<Client>| {
+                        let ClientRequest::ExtMethodRequest(request) = request else {
+                            return Ok(Handled::No {
+                                message: (request, responder),
+                                retry: false,
+                            });
+                        };
+
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.ext_method(request).await)
+                        })?;
+                        Ok(Handled::Yes)
                     }
                 },
                 acp::on_receive_request!(),
@@ -491,6 +523,16 @@ impl CodexAgent {
             .close(SessionCloseCapabilities::new())
             .fork(SessionForkCapabilities::new())
             .list(SessionListCapabilities::new());
+
+        let mut meta = Meta::new();
+        meta.insert(
+            ZED_SESSION_TRUNCATE_META_KEY.to_owned(),
+            json!({
+                "version": 1,
+                "method": ZED_SESSION_TRUNCATE_METHOD,
+            }),
+        );
+        agent_capabilities = agent_capabilities.meta(meta);
 
         let auth_methods = supported_auth_methods();
 
@@ -874,9 +916,30 @@ impl CodexAgent {
 
         // Get the session state
         let thread = self.get_thread(&request.session_id)?;
+        let user_message_id = request.message_id.clone();
         let stop_reason = thread.prompt(request).await?;
 
-        Ok(PromptResponse::new(stop_reason))
+        Ok(PromptResponse::new(stop_reason).user_message_id(user_message_id))
+    }
+
+    async fn ext_method(&self, request: ExtRequest) -> Result<serde_json::Value, Error> {
+        if request.method.as_ref() != ZED_SESSION_TRUNCATE_METHOD {
+            return Err(Error::method_not_found());
+        }
+
+        let request: TruncateSessionRequest = serde_json::from_str(request.params.get())
+            .map_err(|err| Error::invalid_params().data(err.to_string()))?;
+
+        if request.message_id.is_empty() {
+            return Err(Error::invalid_params().data("messageId is required"));
+        }
+
+        let thread = self.get_thread(&request.session_id)?;
+        thread
+            .truncate(request.user_message_index, request.user_message_count)
+            .await?;
+
+        Ok(json!({}))
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {

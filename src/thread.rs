@@ -239,6 +239,11 @@ enum ThreadMessage {
         request: PromptRequest,
         response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<StopReason, Error>>, Error>>,
     },
+    Truncate {
+        user_message_index: usize,
+        user_message_count: usize,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
     SetMode {
         mode: SessionModeId,
         response_tx: oneshot::Sender<Result<(), Error>>,
@@ -347,6 +352,25 @@ impl Thread {
         response_rx
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))??
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn truncate(
+        &self,
+        user_message_index: usize,
+        user_message_count: usize,
+    ) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::Truncate {
+            user_message_index,
+            user_message_count,
+            response_tx,
+        };
+        drop(self.message_tx.send(message));
+
+        response_rx
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
@@ -846,6 +870,7 @@ enum SubmissionState {
     Skills(SkillsState),
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
+    Rollback(RollbackState),
     Rename(RenameState),
 }
 
@@ -854,6 +879,7 @@ impl SubmissionState {
         match self {
             Self::Skills(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
+            Self::Rollback(state) => state.is_active(),
             Self::Rename(state) => state.is_active(),
         }
     }
@@ -862,6 +888,7 @@ impl SubmissionState {
         match self {
             Self::Skills(state) => state.handle_event(event),
             Self::Prompt(state) => state.handle_event(client, event).await,
+            Self::Rollback(state) => state.handle_event(event),
             Self::Rename(state) => state.handle_event(client, event),
         }
     }
@@ -874,6 +901,7 @@ impl SubmissionState {
     ) -> Result<(), Error> {
         match self {
             Self::Skills(..) => Ok(()),
+            Self::Rollback(..) => Ok(()),
             Self::Prompt(state) => {
                 state
                     .handle_permission_request_resolved(client, request_key, response)
@@ -892,6 +920,7 @@ impl SubmissionState {
             Self::Prompt(state) => {
                 state.abort_pending_interactions();
             }
+            Self::Rollback(_) => {}
             Self::Rename(_) => {}
         }
     }
@@ -908,6 +937,7 @@ impl SubmissionState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            Self::Rollback(state) => state.fail(err),
             Self::Rename(state) => state.fail(err),
         }
     }
@@ -982,6 +1012,59 @@ struct PromptState {
 
 struct RenameState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+}
+
+struct RollbackState {
+    response_tx: Option<oneshot::Sender<Result<(), Error>>>,
+}
+
+impl RollbackState {
+    fn new(response_tx: oneshot::Sender<Result<(), Error>>) -> Self {
+        Self {
+            response_tx: Some(response_tx),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.response_tx
+            .as_ref()
+            .is_some_and(|response_tx| !response_tx.is_closed())
+    }
+
+    fn fail(&mut self, err: Error) {
+        if let Some(response_tx) = self.response_tx.take() {
+            drop(response_tx.send(Err(err)));
+        }
+    }
+
+    fn handle_event(&mut self, event: EventMsg) {
+        match event {
+            EventMsg::ThreadRolledBack(..) => {
+                if let Some(response_tx) = self.response_tx.take() {
+                    drop(response_tx.send(Ok(())));
+                }
+            }
+            EventMsg::Error(ErrorEvent {
+                message,
+                codex_error_info,
+            }) => self.fail(
+                Error::internal_error()
+                    .data(json!({ "message": message, "codex_error_info": codex_error_info })),
+            ),
+            EventMsg::StreamError(StreamErrorEvent {
+                message,
+                codex_error_info,
+                additional_details,
+            }) => self.fail(Error::internal_error().data(json!({
+                "message": message,
+                "codex_error_info": codex_error_info,
+                "additional_details": additional_details,
+            }))),
+            event => {
+                debug!("Ignoring event for rollback submission: {event:?}");
+            }
+        }
+    }
 }
 
 impl RenameState {
@@ -3537,6 +3620,7 @@ enum ReplayFunctionCall {
 #[derive(Default)]
 struct ReplayState {
     current_turn_id: Option<String>,
+    user_message_count: usize,
     pending_function_calls: HashMap<String, ReplayFunctionCall>,
     processes: HashMap<String, ReplayExecCall>,
 }
@@ -3679,10 +3763,24 @@ impl SessionClient {
         }
     }
 
-    fn send_user_message(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
-            text.into().into(),
-        )));
+    fn user_message_id(&self, user_message_index: usize) -> String {
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!(
+                "codex-acp:{}:user-message:{user_message_index}",
+                self.session_id.0
+            )
+            .as_bytes(),
+        )
+        .to_string()
+    }
+
+    fn send_user_message(&self, text: impl Into<String>, message_id: Option<String>) {
+        let mut chunk = ContentChunk::new(text.into().into());
+        if let Some(message_id) = message_id {
+            chunk = chunk.message_id(message_id);
+        }
+        self.send_notification(SessionUpdate::UserMessageChunk(chunk));
     }
 
     fn send_agent_text(&self, text: impl Into<String>) {
@@ -3892,6 +3990,14 @@ impl<A: Auth> ThreadActor<A> {
             } => {
                 let result = self.handle_prompt(request).await;
                 drop(response_tx.send(result));
+            }
+            ThreadMessage::Truncate {
+                user_message_index,
+                user_message_count,
+                response_tx,
+            } => {
+                self.handle_truncate(user_message_index, user_message_count, response_tx)
+                    .await;
             }
             ThreadMessage::SetMode { mode, response_tx } => {
                 let result = self.handle_set_mode(mode).await;
@@ -4832,6 +4938,42 @@ impl<A: Auth> ThreadActor<A> {
         Ok(response_rx)
     }
 
+    async fn handle_truncate(
+        &mut self,
+        user_message_index: usize,
+        user_message_count: usize,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    ) {
+        if user_message_index >= user_message_count {
+            drop(response_tx.send(Err(Error::invalid_params().data(json!({
+                "user_message_index": user_message_index,
+                "user_message_count": user_message_count,
+            })))));
+            return;
+        }
+
+        let num_turns = user_message_count - user_message_index;
+        let num_turns = match u32::try_from(num_turns) {
+            Ok(num_turns) => num_turns,
+            Err(err) => {
+                drop(response_tx.send(Err(Error::invalid_params().data(err.to_string()))));
+                return;
+            }
+        };
+
+        match self.thread.submit(Op::ThreadRollback { num_turns }).await {
+            Ok(submission_id) => {
+                self.submissions.insert(
+                    submission_id,
+                    SubmissionState::Rollback(RollbackState::new(response_tx)),
+                );
+            }
+            Err(err) => {
+                drop(response_tx.send(Err(Error::internal_error().data(err.to_string()))));
+            }
+        }
+    }
+
     async fn submit_plan_implementation(&mut self, approval_preset_id: &str) -> Result<(), Error> {
         let preset = Self::approval_preset(approval_preset_id)?;
         let collaboration_mode = self.collaboration_mode_for(ModeKind::Default).await?;
@@ -5071,7 +5213,10 @@ impl<A: Auth> ThreadActor<A> {
     async fn replay_event_msg(&mut self, replay_state: &mut ReplayState, msg: &EventMsg) {
         match msg {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
-                self.client.send_user_message(message.clone());
+                let message_id = self.client.user_message_id(replay_state.user_message_count);
+                replay_state.user_message_count += 1;
+                self.client
+                    .send_user_message(message.clone(), Some(message_id));
             }
             EventMsg::AgentMessage(AgentMessageEvent {
                 message,
