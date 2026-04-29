@@ -101,6 +101,8 @@ impl CodexAgent {
         self: Arc<Self>,
         transport: impl ConnectTo<Agent> + 'static,
     ) -> acp::Result<()> {
+        self.bootstrap_chatgpt_auth_if_required().await?;
+
         let agent = self;
         Agent
             .builder()
@@ -337,6 +339,31 @@ impl CodexAgent {
         Ok(())
     }
 
+    async fn bootstrap_chatgpt_auth_if_required(&self) -> Result<(), Error> {
+        if self.config.model_provider_id != "openai" || self.auth_manager.auth().await.is_some() {
+            return Ok(());
+        }
+
+        eprintln!("No Codex authentication found; starting ChatGPT login.");
+        self.login_with_chatgpt(false).await
+    }
+
+    async fn login_with_chatgpt(&self, open_browser: bool) -> Result<(), Error> {
+        let opts = chatgpt_login_server_options(&self.config, open_browser);
+
+        let server = codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
+
+        print_login_server_start(server.actual_port, &server.auth_url, open_browser);
+
+        server
+            .block_until_done()
+            .await
+            .map_err(Error::into_internal_error)?;
+
+        self.auth_manager.reload();
+        Ok(())
+    }
+
     /// Build a session config from base config, working directory, and MCP servers.
     /// This is shared between `new_session` and `load_session`.
     fn build_session_config(
@@ -465,15 +492,7 @@ impl CodexAgent {
             .fork(SessionForkCapabilities::new())
             .list(SessionListCapabilities::new());
 
-        let mut auth_methods = vec![
-            CodexAuthMethod::ChatGpt.into(),
-            CodexAuthMethod::CodexApiKey.into(),
-            CodexAuthMethod::OpenAiApiKey.into(),
-        ];
-        // Until codex device code auth works, we can't use this in remote ssh projects
-        if std::env::var("NO_BROWSER").is_ok() {
-            auth_methods.remove(0);
-        }
+        let auth_methods = supported_auth_methods();
 
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
@@ -503,23 +522,8 @@ impl CodexAgent {
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
-                // Perform browser/device login via codex-rs, then report success/failure to the client.
-                let opts = codex_login::ServerOptions::new(
-                    self.config.codex_home.to_path_buf(),
-                    codex_login::auth::CLIENT_ID.to_string(),
-                    None,
-                    self.config.cli_auth_credentials_store_mode,
-                );
-
-                let server =
-                    codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
-
-                server
-                    .block_until_done()
-                    .await
-                    .map_err(Error::into_internal_error)?;
-
-                self.auth_manager.reload();
+                let open_browser = std::env::var_os("NO_BROWSER").is_none();
+                self.login_with_chatgpt(open_browser).await?;
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
@@ -924,6 +928,41 @@ impl CodexAgent {
     }
 }
 
+fn supported_auth_methods() -> Vec<AuthMethod> {
+    vec![
+        CodexAuthMethod::ChatGpt.into(),
+        CodexAuthMethod::CodexApiKey.into(),
+        CodexAuthMethod::OpenAiApiKey.into(),
+    ]
+}
+
+fn chatgpt_login_server_options(config: &Config, open_browser: bool) -> codex_login::ServerOptions {
+    let mut opts = codex_login::ServerOptions::new(
+        config.codex_home.to_path_buf(),
+        codex_login::auth::CLIENT_ID.to_string(),
+        config.forced_chatgpt_workspace_id.clone(),
+        config.cli_auth_credentials_store_mode,
+    );
+    opts.open_browser = open_browser;
+    opts
+}
+
+fn print_login_server_start(actual_port: u16, auth_url: &str, open_browser: bool) {
+    let browser_instruction = if open_browser {
+        "If your browser did not open, navigate to this URL to authenticate:"
+    } else {
+        "Open this URL in a browser to authenticate:"
+    };
+
+    eprintln!(
+        "Starting local login server on http://localhost:{actual_port}.\n\
+{browser_instruction}\n\n\
+{auth_url}\n\n\
+On a remote or headless machine, complete login in any browser. If the browser cannot reach this machine's localhost callback, copy the final localhost callback URL and run this on this machine:\n\
+curl '<callback-url>'"
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexAuthMethod {
     ChatGpt,
@@ -991,6 +1030,19 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    #[test]
+    fn supported_auth_methods_include_chatgpt() {
+        let auth_method_ids = supported_auth_methods()
+            .into_iter()
+            .map(|method| method.id().0.as_ref().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            auth_method_ids,
+            vec!["chatgpt", "codex-api-key", "openai-api-key"]
+        );
+    }
+
     #[tokio::test]
     async fn initialize_advertises_session_fork() -> anyhow::Result<()> {
         let codex_home =
@@ -1012,6 +1064,35 @@ mod tests {
                 .session_capabilities
                 .fork
                 .is_some()
+        );
+
+        drop(std::fs::remove_dir_all(codex_home));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chatgpt_login_server_options_control_browser_opening() -> anyhow::Result<()> {
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-acp-login-options-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+
+        let mut config =
+            Config::load_default_with_cli_overrides_for_codex_home(codex_home.clone(), vec![])
+                .await?;
+        config.forced_chatgpt_workspace_id = Some("workspace-id".to_string());
+
+        let browser_opts = chatgpt_login_server_options(&config, true);
+        assert!(browser_opts.open_browser);
+        assert_eq!(
+            browser_opts.forced_chatgpt_workspace_id.as_deref(),
+            Some("workspace-id")
+        );
+
+        let headless_opts = chatgpt_login_server_options(&config, false);
+        assert!(!headless_opts.open_browser);
+        assert_eq!(
+            headless_opts.forced_chatgpt_workspace_id.as_deref(),
+            Some("workspace-id")
         );
 
         drop(std::fs::remove_dir_all(codex_home));
