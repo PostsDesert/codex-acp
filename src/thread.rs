@@ -60,12 +60,12 @@ use codex_protocol::{
         CollabCloseBeginEvent, CollabCloseEndEvent, CollabResumeBeginEvent, CollabResumeEndEvent,
         CollabWaitingBeginEvent, CollabWaitingEndEvent, DynamicToolCallResponseEvent,
         ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
-        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
-        ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus,
-        ItemCompletedEvent, ItemStartedEvent, ListSkillsResponseEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
+        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandSource,
+        ExecCommandStatus, ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent,
+        GuardianAssessmentStatus, ItemCompletedEvent, ItemStartedEvent, ListSkillsResponseEvent,
+        McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
+        McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
+        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SandboxPolicy, SkillMetadata,
         SkillsListEntry, StreamErrorEvent, TerminalInteractionEvent, TokenCountEvent,
@@ -3524,6 +3524,7 @@ fn build_user_input_permission_options(
 struct ReplayExecCall {
     turn_id: String,
     original_call_id: String,
+    command_display: String,
 }
 
 enum ReplayFunctionCall {
@@ -3542,6 +3543,14 @@ struct ReplayUnifiedExecOutput {
     process_id: Option<String>,
     exit_code: Option<i32>,
     output: String,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundTerminal {
+    key: String,
+    call_id: String,
+    command_display: String,
+    recent_chunks: Vec<String>,
 }
 
 struct ParseCommandToolCall {
@@ -3784,6 +3793,8 @@ struct ThreadActor<A> {
     pending_shutdown: Option<oneshot::Sender<Result<(), Error>>>,
     /// Skills discovered for the current working directory.
     skills: Vec<SkillMetadata>,
+    /// Long-lived unified exec processes that can be listed or stopped after a turn ends.
+    background_terminals: Vec<BackgroundTerminal>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -3812,6 +3823,7 @@ impl<A: Auth> ThreadActor<A> {
             current_collaboration_mode_kind: ModeKind::Default,
             pending_shutdown: None,
             skills: Vec::new(),
+            background_terminals: Vec::new(),
         }
     }
 
@@ -3938,6 +3950,109 @@ impl<A: Auth> ThreadActor<A> {
         }
     }
 
+    fn background_terminals_text(&self) -> String {
+        let mut lines = vec!["Background terminals".to_string(), String::new()];
+        if self.background_terminals.is_empty() {
+            lines.push("  - No background terminals running.".to_string());
+        } else {
+            for terminal in self.background_terminals.iter().take(16) {
+                lines.push(format!("  - {}", terminal.command_display));
+                for chunk in terminal.recent_chunks.iter().rev().take(3).rev() {
+                    lines.push(format!("    {}", chunk));
+                }
+            }
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    fn track_background_terminal_begin(
+        &mut self,
+        key: String,
+        call_id: String,
+        command_display: String,
+    ) {
+        if let Some(existing) = self
+            .background_terminals
+            .iter_mut()
+            .find(|terminal| terminal.key == key)
+        {
+            existing.call_id = call_id;
+            existing.command_display = command_display;
+            existing.recent_chunks.clear();
+            return;
+        }
+
+        self.background_terminals.push(BackgroundTerminal {
+            key,
+            call_id,
+            command_display,
+            recent_chunks: Vec::new(),
+        });
+    }
+
+    fn track_background_terminal_output(&mut self, call_id: &str, chunk: &[u8]) {
+        let Some(terminal) = self
+            .background_terminals
+            .iter_mut()
+            .find(|terminal| terminal.call_id == call_id)
+        else {
+            return;
+        };
+
+        let text = String::from_utf8_lossy(chunk);
+        let text = text.trim_end_matches(['\r', '\n']);
+        if text.is_empty() {
+            return;
+        }
+
+        terminal.recent_chunks.push(text.to_string());
+        const MAX_RECENT_CHUNKS: usize = 8;
+        if terminal.recent_chunks.len() > MAX_RECENT_CHUNKS {
+            let excess = terminal.recent_chunks.len() - MAX_RECENT_CHUNKS;
+            terminal.recent_chunks.drain(0..excess);
+        }
+    }
+
+    fn track_background_terminal_end(&mut self, key: &str) {
+        self.background_terminals
+            .retain(|terminal| terminal.key != key && terminal.call_id != key);
+    }
+
+    fn track_background_terminal_event(&mut self, msg: &EventMsg) {
+        match msg {
+            EventMsg::ExecCommandBegin(event)
+                if event.source == ExecCommandSource::UnifiedExecStartup =>
+            {
+                let key = event
+                    .process_id
+                    .clone()
+                    .unwrap_or_else(|| event.call_id.clone());
+                self.track_background_terminal_begin(
+                    key,
+                    event.call_id.clone(),
+                    command_display(&event.command),
+                );
+            }
+            EventMsg::ExecCommandOutputDelta(event) => {
+                self.track_background_terminal_output(&event.call_id, &event.chunk);
+            }
+            EventMsg::ExecCommandEnd(event) => {
+                let key = event.process_id.as_deref().unwrap_or(&event.call_id);
+                self.track_background_terminal_end(key);
+            }
+            EventMsg::TurnAborted(event)
+                if matches!(
+                    event.reason,
+                    codex_protocol::protocol::TurnAbortReason::Interrupted
+                ) =>
+            {
+                self.background_terminals.clear();
+            }
+            _ => {}
+        }
+    }
+
     fn builtin_commands() -> Vec<AvailableCommand> {
         vec![
             AvailableCommand::new("review", "Review my current changes and find issues").input(
@@ -3971,6 +4086,9 @@ impl<A: Auth> ThreadActor<A> {
                 AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("new name")),
             ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
+            AvailableCommand::new("ps", "list background terminals"),
+            AvailableCommand::new("stop", "stop all background terminals"),
+            AvailableCommand::new("clean", "stop all background terminals"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
     }
@@ -4569,6 +4687,23 @@ impl<A: Auth> ThreadActor<A> {
                     "logout" => {
                         self.auth.logout()?;
                         return Err(Error::auth_required());
+                    }
+                    "ps" => {
+                        self.client
+                            .send_agent_text(self.background_terminals_text());
+                        drop(response_tx.send(Ok(StopReason::EndTurn)));
+                        return Ok(response_rx);
+                    }
+                    "stop" | "clean" => {
+                        self.thread
+                            .submit(Op::CleanBackgroundTerminals)
+                            .await
+                            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+                        self.background_terminals.clear();
+                        self.client
+                            .send_agent_text("Stopping all background terminals.\n".to_string());
+                        drop(response_tx.send(Ok(StopReason::EndTurn)));
+                        return Ok(response_rx);
                     }
                     "rename" if !rest.is_empty() => {
                         let name = normalize_thread_name(rest).ok_or_else(Error::invalid_params)?;
@@ -5171,15 +5306,20 @@ impl<A: Auth> ThreadActor<A> {
         turn_id: String,
         call_id: String,
         arguments: &str,
-    ) -> bool {
+    ) -> Option<ReplayExecCall> {
         let Some((cwd, parsed_cmd)) = self.parse_exec_command_function_call(arguments) else {
-            return false;
+            return None;
         };
+        let ParseCommandToolCall { title, .. } = parse_command_tool_call(parsed_cmd.clone(), &cwd);
         let raw_input = serde_json::from_str(arguments).ok();
         let mut prompt = self.take_or_create_replay_prompt(&turn_id);
-        prompt.begin_active_command(&self.client, call_id, cwd, parsed_cmd, raw_input);
-        self.store_replay_prompt(turn_id, prompt);
-        true
+        prompt.begin_active_command(&self.client, call_id.clone(), cwd, parsed_cmd, raw_input);
+        self.store_replay_prompt(turn_id.clone(), prompt);
+        Some(ReplayExecCall {
+            turn_id,
+            original_call_id: call_id,
+            command_display: title,
+        })
     }
 
     fn replay_unified_exec_input(&mut self, exec: &ReplayExecCall, chars: &str) {
@@ -5263,15 +5403,12 @@ impl<A: Auth> ThreadActor<A> {
 
                 if name == "exec_command"
                     && let Some(turn_id) = replay_state.current_turn_id.clone()
-                    && self.replay_unified_exec_begin(turn_id.clone(), call_id.clone(), arguments)
+                    && let Some(exec) =
+                        self.replay_unified_exec_begin(turn_id.clone(), call_id.clone(), arguments)
                 {
-                    replay_state.pending_function_calls.insert(
-                        call_id.clone(),
-                        ReplayFunctionCall::UnifiedExec(ReplayExecCall {
-                            turn_id,
-                            original_call_id: call_id.clone(),
-                        }),
-                    );
+                    replay_state
+                        .pending_function_calls
+                        .insert(call_id.clone(), ReplayFunctionCall::UnifiedExec(exec));
                     return;
                 }
 
@@ -5341,11 +5478,17 @@ impl<A: Auth> ThreadActor<A> {
                     Some(ReplayFunctionCall::UnifiedExec(exec)) => {
                         if let Some(parsed_output) = Self::parse_unified_exec_output(output) {
                             if let Some(process_id) = parsed_output.process_id.clone() {
+                                self.track_background_terminal_begin(
+                                    process_id.clone(),
+                                    exec.original_call_id.clone(),
+                                    exec.command_display.clone(),
+                                );
                                 replay_state.processes.insert(process_id, exec.clone());
                             } else {
                                 replay_state.processes.retain(|_, active| {
                                     active.original_call_id != exec.original_call_id
                                 });
+                                self.track_background_terminal_end(&exec.original_call_id);
                             }
 
                             self.replay_unified_exec_output(exec, output);
@@ -5460,6 +5603,8 @@ impl<A: Auth> ThreadActor<A> {
             self.refresh_skills(true).await;
             return;
         }
+
+        self.track_background_terminal_event(&msg);
 
         if let EventMsg::TurnStarted(TurnStartedEvent {
             collaboration_mode_kind,
@@ -5848,6 +5993,20 @@ fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
 }
 
+fn command_display(command: &[String]) -> String {
+    if command.len() == 3
+        && matches!(command[0].as_str(), "bash" | "sh" | "zsh")
+        && command[1] == "-lc"
+    {
+        return command[2].clone();
+    }
+
+    let parts = command.iter().map(String::as_str).collect::<Vec<_>>();
+    shlex::try_join(parts.iter().copied())
+        .ok()
+        .unwrap_or_else(|| command.join(" "))
+}
+
 /// Checks if a prompt is slash command
 fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     let line = content.first().and_then(|block| match block {
@@ -6070,6 +6229,107 @@ mod tests {
 
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Undo]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ps_lists_background_terminals() -> anyhow::Result<()> {
+        let (client, _thread, mut actor) = setup_actor().await?;
+        let turn_id = "turn-ps".to_string();
+        let cwd = std::env::current_dir()?;
+
+        actor
+            .handle_event(Event {
+                id: turn_id.clone(),
+                msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                    call_id: "call-ps".to_string(),
+                    process_id: Some("process-ps".to_string()),
+                    turn_id: turn_id.clone(),
+                    command: vec!["bash".to_string(), "-lc".to_string(), "sleep 5".to_string()],
+                    cwd: cwd.try_into()?,
+                    parsed_cmd: vec![ParsedCommand::Unknown {
+                        cmd: "sleep 5".to_string(),
+                    }],
+                    source: ExecCommandSource::UnifiedExecStartup,
+                    interaction_input: None,
+                }),
+            })
+            .await;
+        actor
+            .handle_event(Event {
+                id: turn_id,
+                msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                    call_id: "call-ps".to_string(),
+                    stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+                    chunk: b"still running\n".to_vec(),
+                }),
+            })
+            .await;
+
+        let response_rx = actor
+            .handle_prompt(PromptRequest::new(
+                SessionId::new("test"),
+                vec!["/ps".into()],
+            ))
+            .await?;
+        assert_eq!(response_rx.await??, StopReason::EndTurn);
+
+        let notifications = client.notifications.lock().unwrap();
+        let text = agent_text(&notifications);
+        assert!(text.contains("Background terminals"), "{text}");
+        assert!(text.contains("sleep 5"), "{text}");
+        assert!(text.contains("still running"), "{text}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ps_reports_no_background_terminals() -> anyhow::Result<()> {
+        let (client, _thread, mut actor) = setup_actor().await?;
+
+        let response_rx = actor
+            .handle_prompt(PromptRequest::new(
+                SessionId::new("test"),
+                vec!["/ps".into()],
+            ))
+            .await?;
+        assert_eq!(response_rx.await??, StopReason::EndTurn);
+
+        let notifications = client.notifications.lock().unwrap();
+        let text = agent_text(&notifications);
+        assert!(text.contains("No background terminals running"), "{text}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stop_cleans_background_terminals() -> anyhow::Result<()> {
+        let (client, thread, mut actor) = setup_actor().await?;
+        actor.track_background_terminal_begin(
+            "process-stop".to_string(),
+            "call-stop".to_string(),
+            "sleep 5".to_string(),
+        );
+
+        let response_rx = actor
+            .handle_prompt(PromptRequest::new(
+                SessionId::new("test"),
+                vec!["/stop".into()],
+            ))
+            .await?;
+        assert_eq!(response_rx.await??, StopReason::EndTurn);
+        assert!(actor.background_terminals.is_empty());
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(ops.last(), Some(Op::CleanBackgroundTerminals)));
+
+        let notifications = client.notifications.lock().unwrap();
+        let text = agent_text(&notifications);
+        assert!(
+            text.contains("Stopping all background terminals."),
+            "{text}"
+        );
 
         Ok(())
     }
@@ -7058,7 +7318,8 @@ mod tests {
         Ok((session_id, client, conversation, message_tx, handle))
     }
 
-    async fn setup_actor() -> anyhow::Result<(Arc<StubClient>, ThreadActor<StubAuth>)> {
+    async fn setup_actor()
+    -> anyhow::Result<(Arc<StubClient>, Arc<StubCodexThread>, ThreadActor<StubAuth>)> {
         let session_id = SessionId::new("test");
         let client = Arc::new(StubClient::new());
         let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
@@ -7075,14 +7336,28 @@ mod tests {
         let actor = ThreadActor::new(
             StubAuth,
             session_client,
-            thread,
+            thread.clone(),
             models_manager,
             config,
             message_rx,
             resolution_tx,
             resolution_rx,
         );
-        Ok((client, actor))
+        Ok((client, thread, actor))
+    }
+
+    fn agent_text(notifications: &[SessionNotification]) -> String {
+        notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     struct StubAuth;
@@ -7599,6 +7874,7 @@ mod tests {
                     | Op::PatchApproval { .. }
                     | Op::UserInputAnswer { .. }
                     | Op::OverrideTurnContext { .. }
+                    | Op::CleanBackgroundTerminals
                     | Op::Interrupt => {}
                     Op::SetThreadName { name } => {
                         self.op_tx
@@ -8155,7 +8431,7 @@ mod tests {
     #[tokio::test]
     async fn test_replay_unified_exec_routes_write_stdin_to_original_command() -> anyhow::Result<()>
     {
-        let (client, mut actor) = setup_actor().await?;
+        let (client, _thread, mut actor) = setup_actor().await?;
         let turn_id = "turn-replay";
         let cwd = std::env::current_dir()?;
 
@@ -8247,7 +8523,7 @@ mod tests {
     #[tokio::test]
     async fn test_replay_unified_exec_preserves_active_command_for_live_terminal_end()
     -> anyhow::Result<()> {
-        let (client, mut actor) = setup_actor().await?;
+        let (client, _thread, mut actor) = setup_actor().await?;
         let turn_id = "turn-live";
         let cwd = std::env::current_dir()?;
 
