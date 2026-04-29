@@ -43,7 +43,9 @@ use codex_protocol::{
     error::CodexErr,
     items::TurnItem,
     mcp::CallToolResult,
-    models::{AdditionalPermissionProfile, ResponseItem, WebSearchAction},
+    models::{
+        AdditionalPermissionProfile, FunctionCallOutputPayload, ResponseItem, WebSearchAction,
+    },
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     permissions::{
@@ -973,6 +975,7 @@ struct PromptState {
     saw_plan_output: bool,
     plan_output_text: Option<String>,
     prompted_for_plan_implementation: bool,
+    retain_without_response: bool,
 }
 
 struct RenameState {
@@ -1066,10 +1069,39 @@ impl PromptState {
             saw_plan_output: false,
             plan_output_text: None,
             prompted_for_plan_implementation: false,
+            retain_without_response: false,
+        }
+    }
+
+    fn new_replay(thread: Arc<dyn CodexThreadImpl>) -> Self {
+        let (resolution_tx, _) = mpsc::unbounded_channel();
+        Self {
+            submission_id: String::new(),
+            active_commands: HashMap::new(),
+            active_web_search: None,
+            active_guardian_assessments: HashSet::new(),
+            active_subagents_by_call: HashMap::new(),
+            active_subagent_calls_by_thread: HashMap::new(),
+            thread,
+            resolution_tx,
+            pending_permission_interactions: HashMap::new(),
+            event_count: 0,
+            response_tx: None,
+            seen_message_deltas: false,
+            seen_reasoning_deltas: false,
+            turn_complete: false,
+            turn_collaboration_mode_kind: ModeKind::Default,
+            saw_plan_output: false,
+            plan_output_text: None,
+            prompted_for_plan_implementation: false,
+            retain_without_response: true,
         }
     }
 
     fn is_active(&self) -> bool {
+        if self.retain_without_response {
+            return true;
+        }
         if !self.turn_complete || !self.pending_permission_interactions.is_empty() {
             return true;
         }
@@ -1867,6 +1899,7 @@ impl PromptState {
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
+                self.retain_without_response = false;
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if self.turn_collaboration_mode_kind == ModeKind::Plan
@@ -1902,6 +1935,7 @@ impl PromptState {
                 error!(
                     "Handled error during turn: {message} {codex_error_info:?} {additional_details:?}"
                 );
+                self.retain_without_response = false;
                 self.turn_complete = true;
             }
             EventMsg::Error(ErrorEvent {
@@ -1909,6 +1943,7 @@ impl PromptState {
                 codex_error_info,
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
+                self.retain_without_response = false;
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if let Some(response_tx) = self.response_tx.take() {
@@ -1921,6 +1956,7 @@ impl PromptState {
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
+                self.retain_without_response = false;
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if let Some(response_tx) = self.response_tx.take() {
@@ -1929,6 +1965,7 @@ impl PromptState {
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
+                self.retain_without_response = false;
                 self.abort_pending_interactions();
                 self.turn_complete = true;
                 if let Some(response_tx) = self.response_tx.take() {
@@ -2901,7 +2938,23 @@ impl PromptState {
             parsed_cmd,
             process_id: _,
         } = event;
-        // Create a new tool call for the command execution
+        self.begin_active_command(
+            client,
+            call_id,
+            cwd.to_path_buf(),
+            parsed_cmd,
+            Some(raw_input),
+        );
+    }
+
+    fn begin_active_command(
+        &mut self,
+        client: &SessionClient,
+        call_id: String,
+        cwd: PathBuf,
+        parsed_cmd: Vec<ParsedCommand>,
+        raw_input: Option<serde_json::Value>,
+    ) {
         let tool_call_id = ToolCallId::new(call_id.clone());
         let ParseCommandToolCall {
             title,
@@ -2933,15 +2986,18 @@ impl PromptState {
 
         self.active_commands.insert(call_id.clone(), active_command);
 
-        client.send_tool_call(
-            ToolCall::new(tool_call_id, title)
+        client.send_tool_call({
+            let mut tool_call = ToolCall::new(tool_call_id, title)
                 .kind(kind)
                 .status(ToolCallStatus::InProgress)
                 .locations(locations)
-                .raw_input(raw_input)
                 .content(content)
-                .meta(meta),
-        );
+                .meta(meta);
+            if let Some(raw_input) = raw_input {
+                tool_call = tool_call.raw_input(raw_input);
+            }
+            tool_call
+        });
     }
 
     fn exec_command_output_delta(
@@ -3012,15 +3068,24 @@ impl PromptState {
             process_id: _,
             status,
         } = event;
+        let is_success = exit_code == 0;
+        let status = match status {
+            ExecCommandStatus::Completed => ToolCallStatus::Completed,
+            _ if is_success => ToolCallStatus::Completed,
+            ExecCommandStatus::Failed | ExecCommandStatus::Declined => ToolCallStatus::Failed,
+        };
+        self.finish_active_command(client, call_id, exit_code, status, raw_output);
+    }
+
+    fn finish_active_command(
+        &mut self,
+        client: &SessionClient,
+        call_id: String,
+        exit_code: i32,
+        status: ToolCallStatus,
+        raw_output: serde_json::Value,
+    ) {
         if let Some(active_command) = self.active_commands.remove(&call_id) {
-            let is_success = exit_code == 0;
-
-            let status = match status {
-                ExecCommandStatus::Completed => ToolCallStatus::Completed,
-                _ if is_success => ToolCallStatus::Completed,
-                ExecCommandStatus::Failed | ExecCommandStatus::Declined => ToolCallStatus::Failed,
-            };
-
             client.send_tool_call_update(
                 ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
@@ -3455,6 +3520,30 @@ fn build_user_input_permission_options(
     (options, option_map)
 }
 
+#[derive(Clone)]
+struct ReplayExecCall {
+    turn_id: String,
+    original_call_id: String,
+}
+
+enum ReplayFunctionCall {
+    Plan,
+    UnifiedExec(ReplayExecCall),
+}
+
+#[derive(Default)]
+struct ReplayState {
+    current_turn_id: Option<String>,
+    pending_function_calls: HashMap<String, ReplayFunctionCall>,
+    processes: HashMap<String, ReplayExecCall>,
+}
+
+struct ReplayUnifiedExecOutput {
+    process_id: Option<String>,
+    exit_code: Option<i32>,
+    output: String,
+}
+
 struct ParseCommandToolCall {
     title: String,
     file_extension: Option<String>,
@@ -3815,7 +3904,7 @@ impl<A: Auth> ThreadActor<A> {
                 history,
                 response_tx,
             } => {
-                let result = self.handle_replay_history(history);
+                let result = self.handle_replay_history(history).await;
                 drop(response_tx.send(result));
             }
             ThreadMessage::SubmitPlanImplementation { approval_preset_id } => {
@@ -4745,20 +4834,23 @@ impl<A: Auth> ThreadActor<A> {
     /// This is called when loading a session to stream all prior messages.
     ///
     /// We process both `EventMsg` and `ResponseItem`:
-    /// - `EventMsg` for user/agent messages and reasoning (like the TUI does)
-    /// - `ResponseItem` for tool calls only (not persisted as EventMsg)
-    fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
-        let mut plan_call_ids = std::collections::HashSet::new();
+    /// - `EventMsg` for user/agent messages and turn lifecycle
+    /// - `ResponseItem` for tool calls, including unified exec output
+    async fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
+        let mut replay_state = ReplayState::default();
 
         for item in history {
             match item {
+                RolloutItem::TurnContext(turn_context) => {
+                    replay_state.current_turn_id = turn_context.turn_id;
+                }
                 RolloutItem::EventMsg(event_msg) => {
-                    self.replay_event_msg(&event_msg);
+                    self.replay_event_msg(&mut replay_state, &event_msg).await;
                 }
                 RolloutItem::ResponseItem(response_item) => {
-                    self.replay_response_item(&response_item, &mut plan_call_ids);
+                    self.replay_response_item(&mut replay_state, &response_item);
                 }
-                // Skip SessionMeta, TurnContext, Compacted
+                // Skip SessionMeta and Compacted
                 _ => {}
             }
         }
@@ -4766,8 +4858,8 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     /// Convert and send an EventMsg as ACP notification(s) during replay.
-    /// Handles messages and reasoning - mirrors the live event handling in PromptState.
-    fn replay_event_msg(&self, msg: &EventMsg) {
+    /// Handles messages/reasoning and clears replay-retained prompt state on turn completion.
+    async fn replay_event_msg(&mut self, replay_state: &mut ReplayState, msg: &EventMsg) {
         match msg {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
                 self.client.send_user_message(message.clone());
@@ -4791,10 +4883,45 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::ThreadNameUpdated(event) => {
                 send_session_title_update(&self.client, event.thread_name.clone());
             }
-            // Skip other event types during replay - they either:
-            // - Are transient (deltas, turn lifecycle)
-            // - Don't have direct ACP equivalents
-            // - Are handled via ResponseItem instead
+            EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) => {
+                replay_state.current_turn_id = Some(turn_id.clone());
+            }
+            EventMsg::TurnComplete(TurnCompleteEvent { turn_id, .. }) => {
+                replay_state.current_turn_id = Some(turn_id.clone());
+                self.replay_existing_prompt_event(turn_id, msg.clone())
+                    .await;
+                replay_state.pending_function_calls.retain(|_, call| {
+                    !matches!(call, ReplayFunctionCall::UnifiedExec(exec) if exec.turn_id == *turn_id)
+                });
+                replay_state
+                    .processes
+                    .retain(|_, exec| exec.turn_id != *turn_id);
+            }
+            EventMsg::TurnAborted(TurnAbortedEvent { turn_id, .. }) => {
+                replay_state.current_turn_id.clone_from(turn_id);
+                if let Some(turn_id) = turn_id.as_deref() {
+                    self.replay_existing_prompt_event(turn_id, msg.clone())
+                        .await;
+                    replay_state.pending_function_calls.retain(|_, call| {
+                        !matches!(call, ReplayFunctionCall::UnifiedExec(exec) if exec.turn_id == turn_id)
+                    });
+                    replay_state
+                        .processes
+                        .retain(|_, exec| exec.turn_id != turn_id);
+                }
+            }
+            EventMsg::ShutdownComplete => {
+                if let Some(turn_id) = replay_state.current_turn_id.clone() {
+                    self.replay_existing_prompt_event(&turn_id, msg.clone())
+                        .await;
+                    replay_state.pending_function_calls.retain(|_, call| {
+                        !matches!(call, ReplayFunctionCall::UnifiedExec(exec) if exec.turn_id == turn_id)
+                    });
+                    replay_state
+                        .processes
+                        .retain(|_, exec| exec.turn_id != turn_id);
+                }
+            }
             _ => {}
         }
     }
@@ -4940,13 +5067,177 @@ impl<A: Auth> ThreadActor<A> {
         Some((title, kind, locations))
     }
 
+    fn parse_exec_command_function_call(
+        &self,
+        arguments: &str,
+    ) -> Option<(PathBuf, Vec<ParsedCommand>)> {
+        #[derive(serde::Deserialize)]
+        struct ExecCommandArgs {
+            cmd: String,
+            #[serde(default, alias = "cwd")]
+            workdir: Option<PathBuf>,
+        }
+
+        let args: ExecCommandArgs = serde_json::from_str(arguments).ok()?;
+        let command_vec = shlex::split(&args.cmd)
+            .filter(|parts| !parts.is_empty())
+            .unwrap_or_else(|| vec![args.cmd.clone()]);
+        let cwd = args
+            .workdir
+            .unwrap_or_else(|| self.config.cwd.clone().into());
+        Some((cwd, parse_command(&command_vec)))
+    }
+
+    fn parse_write_stdin_function_call(arguments: &str) -> Option<(String, Option<String>)> {
+        #[derive(serde::Deserialize)]
+        struct WriteStdinArgs {
+            session_id: serde_json::Value,
+            #[serde(default)]
+            chars: Option<String>,
+        }
+
+        let args: WriteStdinArgs = serde_json::from_str(arguments).ok()?;
+        let session_id = match args.session_id {
+            serde_json::Value::String(session_id) => session_id,
+            serde_json::Value::Number(session_id) => session_id.to_string(),
+            _ => return None,
+        };
+        Some((session_id, args.chars))
+    }
+
+    fn parse_unified_exec_output(
+        output: &FunctionCallOutputPayload,
+    ) -> Option<ReplayUnifiedExecOutput> {
+        let text = output.body.to_text()?;
+        let (header, body) = text
+            .split_once("\nOutput:\n")
+            .unwrap_or((text.as_str(), ""));
+
+        let process_id = header.lines().find_map(|line| {
+            line.strip_prefix("Process running with session ID ")
+                .map(str::trim)
+                .filter(|session_id| !session_id.is_empty())
+                .map(ToOwned::to_owned)
+        });
+        let exit_code = header.lines().find_map(|line| {
+            line.strip_prefix("Process exited with code ")
+                .and_then(|code| code.trim().parse::<i32>().ok())
+        });
+
+        if process_id.is_none() && exit_code.is_none() {
+            return None;
+        }
+
+        Some(ReplayUnifiedExecOutput {
+            process_id,
+            exit_code,
+            output: body.to_string(),
+        })
+    }
+
+    fn take_or_create_replay_prompt(&mut self, turn_id: &str) -> PromptState {
+        match self.submissions.remove(turn_id) {
+            Some(SubmissionState::Prompt(prompt)) => prompt,
+            Some(other) => {
+                warn!("Encountered non-prompt submission while replaying turn {turn_id}");
+                self.submissions.insert(turn_id.to_string(), other);
+                PromptState::new_replay(self.thread.clone())
+            }
+            None => PromptState::new_replay(self.thread.clone()),
+        }
+    }
+
+    fn store_replay_prompt(&mut self, turn_id: String, prompt: PromptState) {
+        if prompt.is_active() {
+            self.submissions
+                .insert(turn_id, SubmissionState::Prompt(prompt));
+        }
+    }
+
+    async fn replay_existing_prompt_event(&mut self, turn_id: &str, event: EventMsg) {
+        let Some(submission) = self.submissions.remove(turn_id) else {
+            return;
+        };
+        let SubmissionState::Prompt(mut prompt) = submission else {
+            self.submissions.insert(turn_id.to_string(), submission);
+            return;
+        };
+        prompt.handle_event(&self.client, event).await;
+        self.store_replay_prompt(turn_id.to_string(), prompt);
+    }
+
+    fn replay_unified_exec_begin(
+        &mut self,
+        turn_id: String,
+        call_id: String,
+        arguments: &str,
+    ) -> bool {
+        let Some((cwd, parsed_cmd)) = self.parse_exec_command_function_call(arguments) else {
+            return false;
+        };
+        let raw_input = serde_json::from_str(arguments).ok();
+        let mut prompt = self.take_or_create_replay_prompt(&turn_id);
+        prompt.begin_active_command(&self.client, call_id, cwd, parsed_cmd, raw_input);
+        self.store_replay_prompt(turn_id, prompt);
+        true
+    }
+
+    fn replay_unified_exec_input(&mut self, exec: &ReplayExecCall, chars: &str) {
+        if chars.is_empty() {
+            return;
+        }
+        let mut prompt = self.take_or_create_replay_prompt(&exec.turn_id);
+        prompt.terminal_interaction(
+            &self.client,
+            TerminalInteractionEvent {
+                call_id: exec.original_call_id.clone(),
+                process_id: String::new(),
+                stdin: chars.to_string(),
+            },
+        );
+        self.store_replay_prompt(exec.turn_id.clone(), prompt);
+    }
+
+    fn replay_unified_exec_output(
+        &mut self,
+        exec: ReplayExecCall,
+        output: &FunctionCallOutputPayload,
+    ) -> bool {
+        let Some(parsed_output) = Self::parse_unified_exec_output(output) else {
+            return false;
+        };
+
+        let mut prompt = self.take_or_create_replay_prompt(&exec.turn_id);
+        if !parsed_output.output.is_empty() {
+            prompt.exec_command_output_delta(
+                &self.client,
+                ExecCommandOutputDeltaEvent {
+                    call_id: exec.original_call_id.clone(),
+                    chunk: parsed_output.output.as_bytes().to_vec(),
+                    stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+                },
+            );
+        }
+        if let Some(exit_code) = parsed_output.exit_code {
+            prompt.finish_active_command(
+                &self.client,
+                exec.original_call_id.clone(),
+                exit_code,
+                if exit_code == 0 {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                },
+                serde_json::to_value(output).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        self.store_replay_prompt(exec.turn_id, prompt);
+        true
+    }
+
     /// Convert and send a single ResponseItem as ACP notification(s) during replay.
     /// Only handles tool calls - messages/reasoning are handled via EventMsg.
-    fn replay_response_item(
-        &self,
-        item: &ResponseItem,
-        plan_call_ids: &mut std::collections::HashSet<String>,
-    ) {
+    fn replay_response_item(&mut self, replay_state: &mut ReplayState, item: &ResponseItem) {
         match item {
             // Skip Message and Reasoning - these are handled via EventMsg
             ResponseItem::Message { .. } | ResponseItem::Reasoning { .. } => {}
@@ -4963,7 +5254,56 @@ impl<A: Auth> ThreadActor<A> {
                     }) = serde_json::from_str::<UpdatePlanArgs>(arguments)
                     {
                         self.client.update_plan(plan);
-                        plan_call_ids.insert(call_id.clone());
+                        replay_state
+                            .pending_function_calls
+                            .insert(call_id.clone(), ReplayFunctionCall::Plan);
+                        return;
+                    }
+                }
+
+                if name == "exec_command"
+                    && let Some(turn_id) = replay_state.current_turn_id.clone()
+                    && self.replay_unified_exec_begin(turn_id.clone(), call_id.clone(), arguments)
+                {
+                    replay_state.pending_function_calls.insert(
+                        call_id.clone(),
+                        ReplayFunctionCall::UnifiedExec(ReplayExecCall {
+                            turn_id,
+                            original_call_id: call_id.clone(),
+                        }),
+                    );
+                    return;
+                }
+
+                if name == "write_stdin"
+                    && let Some((session_id, chars)) =
+                        Self::parse_write_stdin_function_call(arguments)
+                    && let Some(exec) = replay_state.processes.get(&session_id).cloned()
+                {
+                    if let Some(chars) = chars.as_deref() {
+                        self.replay_unified_exec_input(&exec, chars);
+                    }
+                    replay_state
+                        .pending_function_calls
+                        .insert(call_id.clone(), ReplayFunctionCall::UnifiedExec(exec));
+                    return;
+                }
+
+                if name == "exec_command" && replay_state.current_turn_id.is_some() {
+                    // A malformed unified exec call should still fall back to the generic
+                    // completed tool rendering below rather than leaving replay state pending.
+                    if let Some((title, kind, locations)) =
+                        self.parse_shell_function_call(name, arguments)
+                    {
+                        self.client.send_tool_call(
+                            ToolCall::new(call_id.clone(), title)
+                                .kind(kind)
+                                .status(ToolCallStatus::Completed)
+                                .locations(locations)
+                                .raw_input(
+                                    serde_json::from_str::<serde_json::Value>(arguments).ok(),
+                                ),
+                        );
                         return;
                     }
                 }
@@ -4994,7 +5334,28 @@ impl<A: Auth> ThreadActor<A> {
                 );
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
-                if plan_call_ids.contains(call_id) {
+                match replay_state.pending_function_calls.remove(call_id) {
+                    Some(ReplayFunctionCall::Plan) => {
+                        return;
+                    }
+                    Some(ReplayFunctionCall::UnifiedExec(exec)) => {
+                        if let Some(parsed_output) = Self::parse_unified_exec_output(output) {
+                            if let Some(process_id) = parsed_output.process_id.clone() {
+                                replay_state.processes.insert(process_id, exec.clone());
+                            } else {
+                                replay_state.processes.retain(|_, active| {
+                                    active.original_call_id != exec.original_call_id
+                                });
+                            }
+
+                            self.replay_unified_exec_output(exec, output);
+                            return;
+                        }
+                    }
+                    None => {}
+                }
+
+                if replay_state.pending_function_calls.contains_key(call_id) {
                     return;
                 }
 
@@ -5528,7 +5889,9 @@ mod tests {
         ThreadId,
         config_types::ModeKind,
         models::FunctionCallOutputPayload,
-        protocol::{CollabAgentRef, CollabAgentStatusEntry, ThreadNameUpdatedEvent},
+        protocol::{
+            CollabAgentRef, CollabAgentStatusEntry, ExecCommandSource, ThreadNameUpdatedEvent,
+        },
         request_user_input::RequestUserInputQuestionOption,
     };
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
@@ -6695,6 +7058,33 @@ mod tests {
         Ok((session_id, client, conversation, message_tx, handle))
     }
 
+    async fn setup_actor() -> anyhow::Result<(Arc<StubClient>, ThreadActor<StubAuth>)> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread,
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+        Ok((client, actor))
+    }
+
     struct StubAuth;
 
     impl Auth for StubAuth {
@@ -7556,6 +7946,77 @@ mod tests {
         );
     }
 
+    fn replay_turn_started(turn_id: &str) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }))
+    }
+
+    fn replay_function_call(
+        name: &str,
+        call_id: &str,
+        arguments: serde_json::Value,
+    ) -> RolloutItem {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            namespace: None,
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            call_id: call_id.to_string(),
+        })
+    }
+
+    fn replay_function_call_output(call_id: &str, output: impl Into<String>) -> RolloutItem {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text(output.into()),
+        })
+    }
+
+    fn unified_exec_output_text(
+        output: &str,
+        process_id: Option<&str>,
+        exit_code: Option<i32>,
+    ) -> String {
+        let mut lines = vec![
+            "Chunk ID: replay".to_string(),
+            "Wall time: 0.0100 seconds".to_string(),
+        ];
+        if let Some(exit_code) = exit_code {
+            lines.push(format!("Process exited with code {exit_code}"));
+        }
+        if let Some(process_id) = process_id {
+            lines.push(format!("Process running with session ID {process_id}"));
+        }
+        lines.push("Original token count: 0".to_string());
+        lines.push("Output:".to_string());
+        lines.push(output.to_string());
+        lines.join("\n")
+    }
+
+    fn tool_calls(notifications: &[SessionNotification]) -> Vec<ToolCall> {
+        notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool_call) => Some(tool_call.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_call_updates(notifications: &[SessionNotification]) -> Vec<ToolCallUpdate> {
+        notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_replay_exec_command_function_call_is_structured() -> anyhow::Result<()> {
         let session_id = SessionId::new("test");
@@ -7571,7 +8032,7 @@ mod tests {
         let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let actor = ThreadActor::new(
+        let mut actor = ThreadActor::new(
             StubAuth,
             session_client,
             thread,
@@ -7581,9 +8042,10 @@ mod tests {
             resolution_tx,
             resolution_rx,
         );
-        let mut plan_call_ids = std::collections::HashSet::new();
+        let mut replay_state = ReplayState::default();
 
         actor.replay_response_item(
+            &mut replay_state,
             &ResponseItem::FunctionCall {
                 id: None,
                 namespace: None,
@@ -7595,7 +8057,6 @@ mod tests {
                 })
                 .to_string(),
             },
-            &mut plan_call_ids,
         );
 
         let notifications = client.notifications.lock().unwrap();
@@ -7627,7 +8088,7 @@ mod tests {
         let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let actor = ThreadActor::new(
+        let mut actor = ThreadActor::new(
             StubAuth,
             session_client,
             thread,
@@ -7637,9 +8098,10 @@ mod tests {
             resolution_tx,
             resolution_rx,
         );
-        let mut plan_call_ids = std::collections::HashSet::new();
+        let mut replay_state = ReplayState::default();
 
         actor.replay_response_item(
+            &mut replay_state,
             &ResponseItem::FunctionCall {
                 id: None,
                 namespace: None,
@@ -7660,15 +8122,14 @@ mod tests {
                 })
                 .to_string(),
             },
-            &mut plan_call_ids,
         );
 
         actor.replay_response_item(
+            &mut replay_state,
             &ResponseItem::FunctionCallOutput {
                 call_id: "plan-call-id".to_string(),
                 output: FunctionCallOutputPayload::from_text("ok".to_string()),
             },
-            &mut plan_call_ids,
         );
 
         let notifications = client.notifications.lock().unwrap();
@@ -7682,7 +8143,203 @@ mod tests {
                     && plan.entries[1].content == "Write summary"
                     && plan.entries[1].status == PlanEntryStatus::Pending
         ));
-        assert!(plan_call_ids.contains("plan-call-id"));
+        assert!(
+            !replay_state
+                .pending_function_calls
+                .contains_key("plan-call-id")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_unified_exec_routes_write_stdin_to_original_command() -> anyhow::Result<()>
+    {
+        let (client, mut actor) = setup_actor().await?;
+        let turn_id = "turn-replay";
+        let cwd = std::env::current_dir()?;
+
+        actor
+            .handle_replay_history(vec![
+                replay_turn_started(turn_id),
+                replay_function_call(
+                    "exec_command",
+                    "call-exec",
+                    serde_json::json!({
+                        "cmd": "make build",
+                        "workdir": cwd,
+                    }),
+                ),
+                replay_function_call_output(
+                    "call-exec",
+                    unified_exec_output_text("Compiling...\n", Some("74418"), None),
+                ),
+                replay_function_call(
+                    "write_stdin",
+                    "call-poll-1",
+                    serde_json::json!({
+                        "session_id": 74418,
+                        "chars": "status\n",
+                    }),
+                ),
+                replay_function_call_output(
+                    "call-poll-1",
+                    unified_exec_output_text("Still running...\n", Some("74418"), None),
+                ),
+                replay_function_call(
+                    "write_stdin",
+                    "call-poll-2",
+                    serde_json::json!({
+                        "session_id": 74418,
+                        "chars": "",
+                    }),
+                ),
+                replay_function_call_output(
+                    "call-poll-2",
+                    unified_exec_output_text("Done\n", None, Some(0)),
+                ),
+                RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: turn_id.to_string(),
+                    last_agent_message: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                })),
+            ])
+            .await?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls = tool_calls(&notifications);
+        let updates = tool_call_updates(&notifications);
+
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "expected only the original exec_command tool call, got {tool_calls:?}"
+        );
+        assert_eq!(tool_calls[0].tool_call_id, ToolCallId::new("call-exec"));
+        assert!(
+            !format!("{tool_calls:?}").contains("call-poll"),
+            "write_stdin polling should not create separate tool calls: {tool_calls:?}"
+        );
+
+        let completed_updates: Vec<_> = updates
+            .iter()
+            .filter(|update| {
+                update.tool_call_id == ToolCallId::new("call-exec")
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+            })
+            .collect();
+        assert_eq!(
+            completed_updates.len(),
+            1,
+            "expected one completion for the original exec_command, got {updates:?}"
+        );
+        assert!(
+            format!("{updates:?}").contains("Still running...")
+                && format!("{updates:?}").contains("status"),
+            "expected replayed polling output and stdin to attach to the original command: {updates:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replay_unified_exec_preserves_active_command_for_live_terminal_end()
+    -> anyhow::Result<()> {
+        let (client, mut actor) = setup_actor().await?;
+        let turn_id = "turn-live";
+        let cwd = std::env::current_dir()?;
+
+        actor
+            .handle_replay_history(vec![
+                replay_turn_started(turn_id),
+                replay_function_call(
+                    "exec_command",
+                    "call-live",
+                    serde_json::json!({
+                        "cmd": "make build",
+                        "workdir": cwd,
+                    }),
+                ),
+                replay_function_call_output(
+                    "call-live",
+                    unified_exec_output_text("Compiling...\n", Some("74418"), None),
+                ),
+            ])
+            .await?;
+
+        actor
+            .handle_event(Event {
+                id: turn_id.to_string(),
+                msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                    call_id: "call-live".to_string(),
+                    stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+                    chunk: b"Done\n".to_vec(),
+                }),
+            })
+            .await;
+        actor
+            .handle_event(Event {
+                id: turn_id.to_string(),
+                msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                    call_id: "call-live".to_string(),
+                    process_id: Some("74418".to_string()),
+                    turn_id: turn_id.to_string(),
+                    command: vec!["make".to_string(), "build".to_string()],
+                    cwd: cwd.try_into()?,
+                    parsed_cmd: Vec::new(),
+                    source: ExecCommandSource::UnifiedExecStartup,
+                    interaction_input: None,
+                    stdout: "Compiling...\nDone\n".to_string(),
+                    stderr: String::new(),
+                    aggregated_output: "Compiling...\nDone\n".to_string(),
+                    exit_code: 0,
+                    duration: Duration::from_millis(10),
+                    formatted_output: "Compiling...\nDone\n".to_string(),
+                    status: ExecCommandStatus::Completed,
+                }),
+            })
+            .await;
+        actor
+            .handle_event(Event {
+                id: turn_id.to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: turn_id.to_string(),
+                    last_agent_message: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                }),
+            })
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let tool_calls = tool_calls(&notifications);
+        let updates = tool_call_updates(&notifications);
+
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "expected one replayed exec tool call, got {tool_calls:?}"
+        );
+        let completed_updates: Vec<_> = updates
+            .iter()
+            .filter(|update| {
+                update.tool_call_id == ToolCallId::new("call-live")
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+            })
+            .collect();
+        assert_eq!(
+            completed_updates.len(),
+            1,
+            "expected the live terminal end to complete the replayed exec command, got {updates:?}"
+        );
+        assert!(
+            format!("{updates:?}").contains("Compiling...")
+                && format!("{updates:?}").contains("Done"),
+            "expected replayed output and live output to land on the same tool call: {updates:?}"
+        );
 
         Ok(())
     }
