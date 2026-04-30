@@ -596,6 +596,8 @@ const MCP_TOOL_APPROVAL_ALLOW_OPTION_ID: &str = "approved";
 const MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID: &str = "approved-for-session";
 const MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID: &str = "approved-always";
 const MCP_TOOL_APPROVAL_CANCEL_OPTION_ID: &str = "cancel";
+const ZED_EXTRA_TEXT_PROMPT_META_KEY: &str = "zed:extra_text_prompt";
+const ZED_EXTRA_TEXT_RESPONSE_META_KEY: &str = "zed:extra_text_response";
 const PLAN_MODE_DESCRIPTION: &str =
     "Codex can help create and refine a plan before implementation.";
 const PLAN_IMPLEMENTATION_ACCEPT_DEFAULT_OPTION_ID: &str = "accept-plan-default";
@@ -1299,10 +1301,15 @@ impl PromptState {
         &self,
         client: &SessionClient,
         call_id: impl Into<ToolCallId>,
+        content: Vec<ToolCallContent>,
+        raw_output: serde_json::Value,
     ) {
         client.send_tool_call_update(ToolCallUpdate::new(
             call_id,
-            ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(content)
+                .raw_output(raw_output),
         ));
     }
 
@@ -1336,10 +1343,15 @@ impl PromptState {
         client: &SessionClient,
         call_id: String,
         turn_id: String,
+        questions: &[RequestUserInputQuestion],
         answers: HashMap<String, RequestUserInputAnswer>,
     ) -> Result<(), Error> {
+        let content = user_input_answers_content(questions, &answers);
+        let raw_output = serde_json::json!({
+            "answers": &answers,
+        });
         self.submit_user_input_answers(turn_id, answers).await?;
-        self.complete_user_input_tool_call(client, call_id);
+        self.complete_user_input_tool_call(client, call_id, content, raw_output);
         Ok(())
     }
 
@@ -1606,7 +1618,7 @@ impl PromptState {
                 option_map,
             } => {
                 let Some(question) = questions.get(question_index) else {
-                    self.finalize_user_input_answers(client, call_id, turn_id, answers)
+                    self.finalize_user_input_answers(client, call_id, turn_id, &questions, answers)
                         .await?;
                     return Ok(());
                 };
@@ -1614,27 +1626,36 @@ impl PromptState {
                 let selected_answer = match response.outcome {
                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
                         option_id,
+                        meta,
                         ..
-                    }) => option_map.get(option_id.0.as_ref()).cloned(),
+                    }) => option_map
+                        .get(option_id.0.as_ref())
+                        .cloned()
+                        .map(|answer| (answer, extra_text_response_from_meta(meta.as_ref()))),
                     RequestPermissionOutcome::Cancelled | _ => None,
                 };
 
-                let Some(answer) = selected_answer else {
-                    self.finalize_user_input_answers(client, call_id, turn_id, answers)
+                let Some((answer, extra_text)) = selected_answer else {
+                    self.finalize_user_input_answers(client, call_id, turn_id, &questions, answers)
                         .await?;
                     return Ok(());
                 };
 
+                let mut answer_values = vec![answer];
+                if let Some(extra_text) = extra_text {
+                    answer_values.push(extra_text);
+                }
+
                 answers.insert(
                     question.id.clone(),
                     RequestUserInputAnswer {
-                        answers: vec![answer],
+                        answers: answer_values,
                     },
                 );
 
                 let next_question_index = question_index + 1;
                 if next_question_index >= questions.len() {
-                    self.finalize_user_input_answers(client, call_id, turn_id, answers)
+                    self.finalize_user_input_answers(client, call_id, turn_id, &questions, answers)
                         .await?;
                     return Ok(());
                 }
@@ -2192,7 +2213,7 @@ impl PromptState {
         } = event;
 
         if questions.is_empty() {
-            self.finalize_user_input_answers(client, call_id, turn_id, HashMap::new())
+            self.finalize_user_input_answers(client, call_id, turn_id, &questions, HashMap::new())
                 .await?;
             return Ok(());
         }
@@ -3568,32 +3589,33 @@ fn build_user_input_permission_options(
         for (index, option) in question_options.iter().enumerate() {
             let option_id = format!("answer-{index}");
             option_map.insert(option_id.clone(), option.label.clone());
-            options.push(PermissionOption::new(
-                option_id,
-                option.label.clone(),
-                PermissionOptionKind::AllowOnce,
-            ));
+            options.push(
+                PermissionOption::new(
+                    option_id,
+                    option.label.clone(),
+                    PermissionOptionKind::AllowOnce,
+                )
+                .meta(extra_text_prompt_meta()),
+            );
         }
     }
 
     if question.is_other {
         let option_id = "answer-other".to_string();
         option_map.insert(option_id.clone(), "other".to_string());
-        options.push(PermissionOption::new(
-            option_id,
-            "Other",
-            PermissionOptionKind::AllowOnce,
-        ));
+        options.push(
+            PermissionOption::new(option_id, "Other", PermissionOptionKind::AllowOnce)
+                .meta(extra_text_prompt_meta()),
+        );
     }
 
     if options.is_empty() {
         let option_id = "answer-continue".to_string();
         option_map.insert(option_id.clone(), "continue".to_string());
-        options.push(PermissionOption::new(
-            option_id,
-            "Continue",
-            PermissionOptionKind::AllowOnce,
-        ));
+        options.push(
+            PermissionOption::new(option_id, "Continue", PermissionOptionKind::AllowOnce)
+                .meta(extra_text_prompt_meta()),
+        );
     }
 
     options.push(PermissionOption::new(
@@ -3603,6 +3625,63 @@ fn build_user_input_permission_options(
     ));
 
     (options, option_map)
+}
+
+fn extra_text_prompt_meta() -> Meta {
+    Meta::from_iter([(
+        ZED_EXTRA_TEXT_PROMPT_META_KEY.to_string(),
+        serde_json::json!({
+            "placeholder": "Add optional details for this answer",
+            "required": false,
+        }),
+    )])
+}
+
+fn extra_text_response_from_meta(meta: Option<&Meta>) -> Option<String> {
+    let text = meta?
+        .get(ZED_EXTRA_TEXT_RESPONSE_META_KEY)?
+        .get("text")?
+        .as_str()?
+        .trim();
+
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn user_input_answers_content(
+    questions: &[RequestUserInputQuestion],
+    answers: &HashMap<String, RequestUserInputAnswer>,
+) -> Vec<ToolCallContent> {
+    let lines = questions
+        .iter()
+        .filter_map(|question| {
+            let answer = answers.get(&question.id)?;
+            let selected = answer.answers.first()?;
+            let mut line = if question.header.is_empty() {
+                selected.clone()
+            } else {
+                format!("{}: {selected}", question.header)
+            };
+
+            if let Some(extra_text) = answer.answers.get(1).filter(|text| !text.trim().is_empty()) {
+                line.push_str("\nNote: ");
+                line.push_str(extra_text.trim());
+            }
+
+            Some(line)
+        })
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+        TextContent::new(lines.join("\n")),
+    )))]
 }
 
 #[derive(Clone)]
@@ -9088,6 +9167,103 @@ mod tests {
                             update.fields.status,
                             Some(ToolCallStatus::Completed)
                         )
+            )
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_submits_extra_text_answer() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("answer-0").meta(Meta::from_iter([(
+                    ZED_EXTRA_TEXT_RESPONSE_META_KEY.to_string(),
+                    json!({ "text": "Use the package in the repo root" }),
+                )])),
+            )),
+        ]));
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .request_user_input(
+                &session_client,
+                RequestUserInputEvent {
+                    call_id: "call-id".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    questions: vec![RequestUserInputQuestion {
+                        id: "target".to_string(),
+                        header: "Target".to_string(),
+                        question: "Which package?".to_string(),
+                        is_other: false,
+                        is_secret: false,
+                        options: Some(vec![RequestUserInputQuestionOption {
+                            label: "npm".to_string(),
+                            description: "Use the npm package file".to_string(),
+                        }]),
+                    }],
+                },
+            )
+            .await?;
+
+        let requests = client.permission_requests.lock().unwrap();
+        assert!(requests.last().is_some_and(|request| {
+            request.options.iter().any(|option| {
+                option.option_id.0.as_ref() == "answer-0"
+                    && option
+                        .meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.contains_key(ZED_EXTRA_TEXT_PROMPT_META_KEY))
+            })
+        }));
+        drop(requests);
+
+        let ThreadMessage::PermissionRequestResolved {
+            submission_id,
+            request_key,
+            response,
+        } = message_rx.recv().await.unwrap()
+        else {
+            panic!("expected permission resolution message");
+        };
+        assert_eq!(submission_id, "submission-id");
+
+        prompt_state
+            .handle_permission_request_resolved(&session_client, request_key, response)
+            .await?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::UserInputAnswer { id, response })
+                if id == "turn-id"
+                    && response.answers.get("target").is_some_and(|answer| {
+                        answer.answers
+                            == vec![
+                                "npm".to_string(),
+                                "Use the package in the repo root".to_string(),
+                            ]
+                    })
+        ));
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.tool_call_id.0.as_ref() == "call-id"
+                        && format!("{:?}", update.fields.content)
+                            .contains("Use the package in the repo root")
             )
         }));
 
